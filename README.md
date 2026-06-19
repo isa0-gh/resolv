@@ -16,11 +16,16 @@
   - AdGuard
   - Cisco
 - Configurable TTL and bind address
+- Graceful UDP listener shutdown on SIGINT and SIGTERM
 
 ---
 
 ## Installation
 - [For Linux](docs/install_linux.md)
+
+## Shutdown
+
+When running `resolv`, press `Ctrl+C` or send `SIGTERM` to stop the UDP listener gracefully. The server closes its UDP socket, stops the cache flusher, and exits cleanly instead of continuing to log read errors.
 
 ## License
 

@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"time"
@@ -48,6 +50,14 @@ func (s *Server) HandleConn(data []byte, addr *net.UDPAddr, conn *net.UDPConn) {
 }
 
 func (s *Server) Run() error {
+	return s.RunContext(context.Background())
+}
+
+func (s *Server) RunContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	addr, err := net.ResolveUDPAddr("udp", s.repo.Config.BindAddress)
 	if err != nil {
 		return err
@@ -57,15 +67,28 @@ func (s *Server) Run() error {
 	if err != nil {
 		return err
 	}
+
+	return s.serveUDP(ctx, conn)
+}
+
+func (s *Server) serveUDP(ctx context.Context, conn *net.UDPConn) error {
 	defer conn.Close()
+	stopShutdownWatch := closeUDPConnOnContext(ctx, conn)
+	defer stopShutdownWatch()
 
 	slog.Info("resolv started.", "resolver", s.repo.Config.Resolver, "listen", s.repo.Config.BindAddress, "config", s.repo.Config)
 
 	buf := make([]byte, 4096)
-	s.repo.Cache.StartFlusher(time.Duration(s.repo.Config.TTL) * time.Second)
+	stopFlusher := s.repo.Cache.StartFlusher(time.Duration(s.repo.Config.TTL) * time.Second)
+	defer stopFlusher()
+
 	for {
 		size, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				slog.Info("resolv stopped.", "listen", s.repo.Config.BindAddress)
+				return nil
+			}
 			slog.Error("ERROR reading from UDP", "error", err)
 			continue
 		}
@@ -73,5 +96,28 @@ func (s *Server) Run() error {
 		request := make([]byte, size)
 		copy(request, buf[:size])
 		go s.HandleConn(request, clientAddr, conn)
+	}
+}
+
+func closeUDPConnOnContext(ctx context.Context, conn *net.UDPConn) func() {
+	shutdownCtx, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		<-shutdownCtx.Done()
+
+		if ctx.Err() == nil {
+			return
+		}
+
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			slog.Error("ERROR closing UDP listener", "error", err)
+		}
+	}()
+
+	return func() {
+		stop()
+		<-done
 	}
 }
