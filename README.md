@@ -16,6 +16,24 @@
   - AdGuard
   - Cisco
 - Configurable TTL and bind address
+- Config validation before starting the DNS listener
+- Effective config printing for deployment/debug workflows
+
+---
+
+## Configuration checks
+
+Validate a config file without starting the DNS server:
+
+```sh
+resolv -config config.toml -check-config
+```
+
+Print the effective TOML config after defaults and file values are loaded:
+
+```sh
+resolv -config config.toml -print-config
+```
 
 ---
 

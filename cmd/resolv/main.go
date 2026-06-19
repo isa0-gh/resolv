@@ -12,6 +12,7 @@ import (
 	"github.com/isa0-gh/resolv/internal/resolver"
 	"github.com/isa0-gh/resolv/internal/server"
 	"github.com/isa0-gh/resolv/internal/service"
+	"github.com/pelletier/go-toml/v2"
 )
 
 func main() {
