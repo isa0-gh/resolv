@@ -13,6 +13,7 @@ import (
 	"github.com/isa0-gh/resolv/internal/resolve-dns"
 	"github.com/isa0-gh/resolv/internal/resolver"
 	"github.com/isa0-gh/resolv/internal/service"
+	"github.com/pelletier/go-toml/v2"
 )
 
 type Server struct {
@@ -53,6 +54,8 @@ func (s *Server) HandleConn(data []byte, addr *net.UDPAddr, conn *net.UDPConn) {
 
 func main() {
 	configPath := flag.String("config", config.DefaultConfigPath, "path to config file")
+	checkConfig := flag.Bool("check-config", false, "validate the config file and exit")
+	printConfig := flag.Bool("print-config", false, "print the effective config as TOML and exit")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -62,6 +65,24 @@ func main() {
 	if err != nil {
 		slog.Error("Failed to load config", "error", err)
 		os.Exit(1)
+	}
+
+	if *printConfig {
+		output, err := toml.Marshal(conf)
+		if err != nil {
+			slog.Error("Failed to print config", "error", err)
+			os.Exit(1)
+		}
+		if _, err := os.Stdout.Write(output); err != nil {
+			slog.Error("Failed to write config", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *checkConfig {
+		slog.Info("Configuration valid", "path", *configPath, "resolver", conf.Resolver, "listen", conf.BindAddress)
+		return
 	}
 
 	client, err := resolvedns.ResolveServer(conf.Resolver)
