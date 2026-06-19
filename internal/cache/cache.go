@@ -1,21 +1,29 @@
 package cache
 
 import (
-	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/miekg/dns"
 )
 
-type CacheDB struct {
-	Mu sync.RWMutex
-	DB map[string]dns.Msg
+type record struct {
+	message   dns.Msg
+	expiresAt time.Time
 }
 
-func New() *CacheDB {
+type CacheDB struct {
+	mu  sync.Mutex
+	db  map[string]record
+	ttl time.Duration
+	now func() time.Time
+}
+
+func New(ttl time.Duration) *CacheDB {
 	return &CacheDB{
-		DB: make(map[string]dns.Msg),
+		db:  make(map[string]record),
+		ttl: ttl,
+		now: time.Now,
 	}
 }
 
@@ -26,13 +34,9 @@ func QueryKey(message *dns.Msg) string {
 	}
 
 	return question[0].Name + "|" + string(rune(question[0].Qtype))
-	
 }
 
 func (c *CacheDB) Add(message []byte, response []byte) error {
-	c.Mu.Lock()
-	defer c.Mu.Unlock()
-
 	req := new(dns.Msg)
 	resp := new(dns.Msg)
 	if err := req.Unpack(message); err != nil {
@@ -44,7 +48,19 @@ func (c *CacheDB) Add(message []byte, response []byte) error {
 	}
 
 	key := QueryKey(req)
-	c.DB[key] = *resp
+	if c.ttl <= 0 {
+		c.mu.Lock()
+		delete(c.db, key)
+		c.mu.Unlock()
+		return nil
+	}
+
+	c.mu.Lock()
+	c.db[key] = record{
+		message:   *resp,
+		expiresAt: c.now().Add(c.ttl),
+	}
+	c.mu.Unlock()
 	return nil
 }
 
@@ -54,28 +70,21 @@ func (c *CacheDB) Get(message []byte) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	key := QueryKey(msg)
-	c.Mu.RLock()
-	defer c.Mu.RUnlock()
-	for k, v := range c.DB {
-		if k == key {
-			v.Id = msg.Id
-			resp, err := v.Pack()
-			return resp, true, err
-		}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	record, ok := c.db[key]
+	if !ok {
+		return nil, false, nil
 	}
-	return nil, false, nil
+
+	if !c.now().Before(record.expiresAt) {
+		delete(c.db, key)
+		return nil, false, nil
+	}
+
+	resp := record.message
+	resp.Id = msg.Id
+	packed, err := resp.Pack()
+	return packed, true, err
 }
-
-func (c *CacheDB) StartFlusher(ttl time.Duration) {
-    ticker := time.NewTicker(ttl)
-    go func() {
-        for range ticker.C {
-            c.Mu.Lock()
-            c.DB = make(map[string]dns.Msg) // flush everything
-            c.Mu.Unlock()
-            slog.Info("Cache flushed")
-        }
-    }()
-}
-
-
