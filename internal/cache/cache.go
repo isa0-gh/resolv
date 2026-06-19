@@ -26,7 +26,6 @@ func QueryKey(message *dns.Msg) string {
 	}
 
 	return question[0].Name + "|" + string(rune(question[0].Qtype))
-	
 }
 
 func (c *CacheDB) Add(message []byte, response []byte) error {
@@ -66,16 +65,34 @@ func (c *CacheDB) Get(message []byte) ([]byte, bool, error) {
 	return nil, false, nil
 }
 
-func (c *CacheDB) StartFlusher(ttl time.Duration) {
-    ticker := time.NewTicker(ttl)
-    go func() {
-        for range ticker.C {
-            c.Mu.Lock()
-            c.DB = make(map[string]dns.Msg) // flush everything
-            c.Mu.Unlock()
-            slog.Info("Cache flushed")
-        }
-    }()
+func (c *CacheDB) StartFlusher(ttl time.Duration) func() {
+	if ttl <= 0 {
+		return func() {}
+	}
+
+	ticker := time.NewTicker(ttl)
+	done := make(chan struct{})
+	var stopOnce sync.Once
+
+	go func() {
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				c.Mu.Lock()
+				c.DB = make(map[string]dns.Msg) // flush everything
+				c.Mu.Unlock()
+				slog.Info("Cache flushed")
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	return func() {
+		stopOnce.Do(func() {
+			close(done)
+		})
+	}
 }
-
-
