@@ -34,7 +34,7 @@ func main() {
 	}
 	conf.Client = client
 
-	cdb := cache.New()
+	cdb := cache.New(time.Duration(conf.TTL) * time.Second)
 	matcher := local.NewMatcher(conf.Hosts, conf.TTL)
 	res := resolver.NewResolver(conf.Resolver, conf.Client)
 	repo := service.NewServiceRepo(conf, cdb, matcher, res)
@@ -42,5 +42,31 @@ func main() {
 	if err := server.New(repo).Run(); err != nil {
 		slog.Error("resolv stopped", "error", err)
 		os.Exit(1)
+	srv := &Server{repo: repo}
+
+	addr, err := net.ResolveUDPAddr("udp", conf.BindAddress)
+	if err != nil {
+		panic(err)
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	slog.Info("resolv started.", "resolver", conf.Resolver, "listen", conf.BindAddress, "config", *configPath)
+
+	buf := make([]byte, 4096)
+	for {
+		size, clientAddr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			slog.Error("ERROR reading from UDP", "error", err)
+			continue
+		}
+
+		request := make([]byte, size)
+		copy(request, buf[:size])
+		go srv.HandleConn(request, clientAddr, conn)
 	}
 }
