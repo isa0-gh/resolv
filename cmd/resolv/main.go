@@ -4,7 +4,6 @@ import (
 	"flag"
 	"log/slog"
 	"os"
-	"time"
 
 	"github.com/isa0-gh/resolv/internal/cache"
 	"github.com/isa0-gh/resolv/internal/config"
