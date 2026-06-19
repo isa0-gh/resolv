@@ -4,6 +4,7 @@ import (
 	"flag"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/isa0-gh/resolv/internal/cache"
 	"github.com/isa0-gh/resolv/internal/config"
@@ -16,6 +17,8 @@ import (
 
 func main() {
 	configPath := flag.String("config", config.DefaultConfigPath, "path to config file")
+	checkConfig := flag.Bool("check-config", false, "validate config and exit")
+	printConfig := flag.Bool("print-config", false, "print config and exit")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -25,6 +28,16 @@ func main() {
 	if err != nil {
 		slog.Error("Failed to load config", "error", err)
 		os.Exit(1)
+	}
+
+	if *checkConfig {
+		slog.Info("Config validation successful", "config", *configPath)
+		os.Exit(0)
+	}
+
+	if *printConfig {
+		slog.Info("Config", "config", conf)
+		os.Exit(0)
 	}
 
 	client, err := resolvedns.ResolveServer(conf.Resolver)
@@ -39,34 +52,9 @@ func main() {
 	res := resolver.NewResolver(conf.Resolver, conf.Client)
 	repo := service.NewServiceRepo(conf, cdb, matcher, res)
 
+	slog.Info("Starting resolv...", "resolver", conf.Resolver, "listen", conf.BindAddress, "config", *configPath)
 	if err := server.New(repo).Run(); err != nil {
 		slog.Error("resolv stopped", "error", err)
 		os.Exit(1)
-	srv := &Server{repo: repo}
-
-	addr, err := net.ResolveUDPAddr("udp", conf.BindAddress)
-	if err != nil {
-		panic(err)
-	}
-
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		panic(err)
-	}
-	defer conn.Close()
-
-	slog.Info("resolv started.", "resolver", conf.Resolver, "listen", conf.BindAddress, "config", *configPath)
-
-	buf := make([]byte, 4096)
-	for {
-		size, clientAddr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			slog.Error("ERROR reading from UDP", "error", err)
-			continue
-		}
-
-		request := make([]byte, size)
-		copy(request, buf[:size])
-		go srv.HandleConn(request, clientAddr, conn)
 	}
 }
