@@ -3,7 +3,6 @@ package server
 import (
 	"log/slog"
 	"net"
-	"time"
 
 	"github.com/isa0-gh/resolv/internal/service"
 )
@@ -62,7 +61,6 @@ func (s *Server) Run() error {
 	slog.Info("resolv started.", "resolver", s.repo.Config.Resolver, "listen", s.repo.Config.BindAddress, "config", s.repo.Config)
 
 	buf := make([]byte, 4096)
-	s.repo.Cache.StartFlusher(time.Duration(s.repo.Config.TTL) * time.Second)
 	for {
 		size, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {

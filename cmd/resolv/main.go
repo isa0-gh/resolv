@@ -71,7 +71,7 @@ func main() {
 	}
 	conf.Client = client
 
-	cdb := cache.New()
+	cdb := cache.New(time.Duration(conf.TTL) * time.Second)
 	matcher := local.NewMatcher(conf.Hosts, conf.TTL)
 	res := resolver.NewResolver(conf.Resolver, conf.Client)
 	repo := service.NewServiceRepo(conf, cdb, matcher, res)
@@ -92,7 +92,6 @@ func main() {
 	slog.Info("resolv started.", "resolver", conf.Resolver, "listen", conf.BindAddress, "config", *configPath)
 
 	buf := make([]byte, 4096)
-	repo.Cache.StartFlusher(time.Duration(conf.TTL) * time.Second)
 	for {
 		size, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
