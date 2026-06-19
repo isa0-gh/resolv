@@ -2,8 +2,11 @@ package resolver
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
+
+	"github.com/miekg/dns"
 )
 
 type Resolver struct {
@@ -32,9 +35,18 @@ func (r *Resolver) Resolve(dnsmessage []byte) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("upstream DoH returned status code %d", resp.StatusCode)
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
+	}
+
+	msg := new(dns.Msg)
+	if err := msg.Unpack(body); err != nil {
+		return nil, fmt.Errorf("invalid upstream DNS response: %w", err)
 	}
 
 	return body, err
