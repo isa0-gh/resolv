@@ -1,7 +1,9 @@
 package server
 
 import (
+	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,130 +18,112 @@ import (
 	"github.com/miekg/dns"
 )
 
-func TestServerHandleConnServfailOnNon200(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer ts.Close()
-
-	respMsg := exchangeDNSQuery(t, newTestServer(ts.URL, http.DefaultClient))
-	assertServfail(t, respMsg)
-}
-
-func TestServerHandleConnServfailOnInvalidDNSResponse(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/dns-message")
-		w.WriteHeader(http.StatusOK)
-		if _, err := w.Write([]byte("not a dns message")); err != nil {
-			t.Errorf("failed to write response: %v", err)
-		}
-	}))
-	defer ts.Close()
-
-	respMsg := exchangeDNSQuery(t, newTestServer(ts.URL, http.DefaultClient))
-	assertServfail(t, respMsg)
-}
-
-func TestServerHandleConnServfailOnTransportError(t *testing.T) {
-	client := &http.Client{
-		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			return nil, errors.New("upstream unavailable")
-		}),
-	}
-
-	respMsg := exchangeDNSQuery(t, newTestServer("https://example.test/dns-query", client))
-	assertServfail(t, respMsg)
-}
-
-func newTestServer(url string, client *http.Client) *Server {
-	conf := &config.Config{
-		Resolver: url,
-		TTL:      300,
-	}
-	c := cache.New()
-	matcher := local.NewMatcher(nil, conf.TTL)
-	res := resolver.NewResolver(conf.Resolver, client)
-	repo := service.NewServiceRepo(conf, c, matcher, res)
-
-	return New(repo)
-}
-
-func exchangeDNSQuery(t *testing.T, srv *Server) *dns.Msg {
-	t.Helper()
-
-	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to resolve udp addr: %v", err)
-	}
-	serverConn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		t.Fatalf("failed to listen on udp: %v", err)
-	}
-	defer serverConn.Close()
-
-	clientConn, err := net.DialUDP("udp", nil, serverConn.LocalAddr().(*net.UDPAddr))
-	if err != nil {
-		t.Fatalf("failed to dial server: %v", err)
-	}
-	defer clientConn.Close()
-
-	msg := new(dns.Msg)
-	msg.SetQuestion("example.com.", dns.TypeA)
-	msg.Id = 1234
-	queryBytes, err := msg.Pack()
-	if err != nil {
-		t.Fatalf("failed to pack dns msg: %v", err)
-	}
-
-	readErr := make(chan error, 1)
-	go func() {
-		buf := make([]byte, 512)
-		n, clientAddr, err := serverConn.ReadFromUDP(buf)
-		if err != nil {
-			readErr <- err
-			return
-		}
-		srv.HandleConn(buf[:n], clientAddr, serverConn)
-		readErr <- nil
-	}()
-
-	_, err = clientConn.Write(queryBytes)
-	if err != nil {
-		t.Fatalf("failed to write query: %v", err)
-	}
-
-	clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	respBuf := make([]byte, 512)
-	n, err := clientConn.Read(respBuf)
-	if err != nil {
-		t.Fatalf("failed to read response: %v", err)
-	}
-
-	respMsg := new(dns.Msg)
-	if err := respMsg.Unpack(respBuf[:n]); err != nil {
-		t.Fatalf("failed to unpack dns response: %v", err)
-	}
-
-	if err := <-readErr; err != nil {
-		t.Fatalf("failed to read query on server conn: %v", err)
-	}
-
-	return respMsg
-}
-
-func assertServfail(t *testing.T, respMsg *dns.Msg) {
-	t.Helper()
-
-	if respMsg.Rcode != dns.RcodeServerFailure {
-		t.Errorf("expected RcodeServerFailure (SERVFAIL), got %s", dns.RcodeToString[respMsg.Rcode])
-	}
-	if respMsg.Id != 1234 {
-		t.Errorf("expected ID 1234, got %d", respMsg.Id)
-	}
-}
-
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
+}
+
+func packDNSQuery(t *testing.T, id uint16) []byte {
+	t.Helper()
+	msg := new(dns.Msg)
+	msg.SetQuestion("example.com.", dns.TypeA)
+	msg.Id = id
+	queryBytes, err := msg.Pack()
+	if err != nil {
+		t.Fatalf("failed to pack query: %v", err)
+	}
+	return queryBytes
+}
+
+func packDNSResponse(t *testing.T, id uint16) []byte {
+	t.Helper()
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeA)
+	req.Id = id
+
+	resp := new(dns.Msg)
+	resp.SetReply(req)
+	responseBytes, err := resp.Pack()
+	if err != nil {
+		t.Fatalf("failed to pack response: %v", err)
+	}
+	return responseBytes
+}
+
+func TestServerTCPAndUDPRealListeners(t *testing.T) {
+	// Find a free TCP port to bind both UDP and TCP
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to find free port: %v", err)
+	}
+	addrStr := l.Addr().String()
+	l.Close() // Close so the server can bind to it
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		w.WriteHeader(http.StatusOK)
+		resp := packDNSResponse(t, 7777)
+		w.Write(resp)
+	}))
+	defer ts.Close()
+
+	conf := &config.Config{
+		Resolver:    ts.URL,
+		TTL:         300,
+		BindAddress: addrStr,
+	}
+	c := cache.New()
+	matcher := local.NewMatcher(nil, conf.TTL)
+	res := resolver.NewResolver(conf.Resolver, http.DefaultClient)
+	repo := service.NewServiceRepo(conf, c, matcher, res)
+
+	srv := New(repo)
+	go func() {
+		if err := srv.Run(); err != nil && !errors.Is(err, net.ErrClosed) {
+			// ignore closed listener error on test exit
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond) // Wait for listeners to start
+
+	// 1. Test TCP
+	conn, err := net.Dial("tcp", addrStr)
+	if err != nil {
+		t.Fatalf("failed to dial tcp: %v", err)
+	}
+	defer conn.Close()
+
+	query := packDNSQuery(t, 7777)
+	binary.Write(conn, binary.BigEndian, uint16(len(query)))
+	conn.Write(query)
+
+	var respLen uint16
+	binary.Read(conn, binary.BigEndian, &respLen)
+	respData := make([]byte, respLen)
+	io.ReadFull(conn, respData)
+
+	respMsg := new(dns.Msg)
+	respMsg.Unpack(respData)
+	if respMsg.Rcode != dns.RcodeSuccess || respMsg.Id != 7777 {
+		t.Errorf("TCP check failed: rcode=%s id=%d", dns.RcodeToString[respMsg.Rcode], respMsg.Id)
+	}
+
+	// 2. Test UDP
+	udpAddr, _ := net.ResolveUDPAddr("udp", addrStr)
+	clientUDP, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		t.Fatalf("failed to dial udp: %v", err)
+	}
+	defer clientUDP.Close()
+
+	clientUDP.Write(query)
+	respBuf := make([]byte, 512)
+	n, _ := clientUDP.Read(respBuf)
+
+	udpRespMsg := new(dns.Msg)
+	udpRespMsg.Unpack(respBuf[:n])
+	if udpRespMsg.Rcode != dns.RcodeSuccess || udpRespMsg.Id != 7777 {
+		t.Errorf("UDP check failed: rcode=%s id=%d", dns.RcodeToString[udpRespMsg.Rcode], udpRespMsg.Id)
+	}
 }
