@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/isa0-gh/resolv/internal/service"
+	"github.com/miekg/dns"
 )
 
 type Server struct {
@@ -33,6 +34,12 @@ func (s *Server) HandleConn(data []byte, addr *net.UDPAddr, conn *net.UDPConn) {
 		resp, err = s.repo.Resolver.Resolve(data)
 		if err != nil {
 			slog.Error("ERROR resolving dns message", "error", err)
+			if sfMsg := servfailResponse(data); sfMsg != nil {
+				_, err = conn.WriteToUDP(sfMsg, addr)
+				if err != nil {
+					slog.Error("ERROR writing servfail to udp", "error", err)
+				}
+			}
 			return
 		}
 		if err := s.repo.Cache.Add(data, resp); err != nil {
@@ -45,6 +52,20 @@ func (s *Server) HandleConn(data []byte, addr *net.UDPAddr, conn *net.UDPConn) {
 		slog.Error("ERROR writing to udp", "error", err)
 		return
 	}
+}
+
+func servfailResponse(query []byte) []byte {
+	req := new(dns.Msg)
+	if err := req.Unpack(query); err != nil {
+		return nil
+	}
+	resp := new(dns.Msg)
+	resp.SetRcode(req, dns.RcodeServerFailure)
+	packed, err := resp.Pack()
+	if err != nil {
+		return nil
+	}
+	return packed
 }
 
 func (s *Server) Run() error {
