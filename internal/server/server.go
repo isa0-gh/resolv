@@ -1,11 +1,14 @@
 package server
 
 import (
+	"encoding/binary"
+	"io"
 	"log/slog"
 	"net"
 	"time"
 
 	"github.com/isa0-gh/resolv/internal/service"
+	"github.com/miekg/dns"
 )
 
 type Server struct {
@@ -16,28 +19,11 @@ func New(repo *service.ServiceRepo) *Server {
 	return &Server{repo: repo}
 }
 
-func (s *Server) HandleConn(data []byte, addr *net.UDPAddr, conn *net.UDPConn) {
-	if localResp, ok := s.repo.Local.Match(data); ok {
-		_, err := conn.WriteToUDP(localResp, addr)
-		if err != nil {
-			slog.Error("ERROR writing local resp", "error", err)
-		}
+func (s *Server) HandleUDPConn(data []byte, addr *net.UDPAddr, conn *net.UDPConn) {
+	resp, err := s.processQuery(data)
+	if err != nil {
+		slog.Error("ERROR processing query over UDP", "error", err)
 		return
-	}
-
-	var resp []byte
-	cached, ok, err := s.repo.Cache.Get(data)
-	if err == nil && ok {
-		resp = cached
-	} else {
-		resp, err = s.repo.Resolver.Resolve(data)
-		if err != nil {
-			slog.Error("ERROR resolving dns message", "error", err)
-			return
-		}
-		if err := s.repo.Cache.Add(data, resp); err != nil {
-			slog.Error("CACHE ERROR", "error", err)
-		}
 	}
 
 	_, err = conn.WriteToUDP(resp, addr)
@@ -47,31 +33,126 @@ func (s *Server) HandleConn(data []byte, addr *net.UDPAddr, conn *net.UDPConn) {
 	}
 }
 
-func (s *Server) Run() error {
-	addr, err := net.ResolveUDPAddr("udp", s.repo.Config.BindAddress)
-	if err != nil {
-		return err
+func (s *Server) HandleTCPConn(conn net.Conn) {
+	defer conn.Close()
+
+	for {
+		var length uint16
+		if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
+			return // Connection closed or timeout
+		}
+
+		data := make([]byte, length)
+		if _, err := io.ReadFull(conn, data); err != nil {
+			return
+		}
+
+		resp, err := s.processQuery(data)
+		if err != nil {
+			slog.Error("ERROR processing query over TCP", "error", err)
+			return
+		}
+
+		respLen := uint16(len(resp))
+		if err := binary.Write(conn, binary.BigEndian, respLen); err != nil {
+			return
+		}
+
+		if _, err := conn.Write(resp); err != nil {
+			return
+		}
+	}
+}
+
+func (s *Server) processQuery(data []byte) ([]byte, error) {
+	if localResp, ok := s.repo.Local.Match(data); ok {
+		return localResp, nil
 	}
 
-	conn, err := net.ListenUDP("udp", addr)
+	cached, ok, err := s.repo.Cache.Get(data)
+	if err == nil && ok {
+		return cached, nil
+	}
+
+	resp, err := s.repo.Resolver.Resolve(data)
+	if err != nil {
+		slog.Error("ERROR resolving dns message", "error", err)
+		if sfMsg := servfailResponse(data); sfMsg != nil {
+			return sfMsg, nil
+		}
+		return nil, err
+	}
+
+	if err := s.repo.Cache.Add(data, resp); err != nil {
+		slog.Error("CACHE ERROR", "error", err)
+	}
+
+	return resp, nil
+}
+
+func servfailResponse(query []byte) []byte {
+	req := new(dns.Msg)
+	if err := req.Unpack(query); err != nil {
+		return nil
+	}
+	resp := new(dns.Msg)
+	resp.SetRcode(req, dns.RcodeServerFailure)
+	packed, err := resp.Pack()
+	if err != nil {
+		return nil
+	}
+	return packed
+}
+
+func (s *Server) Run() error {
+	// Start UDP server
+	udpAddr, err := net.ResolveUDPAddr("udp", s.repo.Config.BindAddress)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return err
+	}
+	defer udpConn.Close()
+
+	// Start TCP server
+	tcpListener, err := net.Listen("tcp", s.repo.Config.BindAddress)
+	if err != nil {
+		return err
+	}
+	defer tcpListener.Close()
 
 	slog.Info("resolv started.", "resolver", s.repo.Config.Resolver, "listen", s.repo.Config.BindAddress, "config", s.repo.Config)
 
-	buf := make([]byte, 4096)
 	s.repo.Cache.StartFlusher(time.Duration(s.repo.Config.TTL) * time.Second)
-	for {
-		size, clientAddr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			slog.Error("ERROR reading from UDP", "error", err)
-			continue
-		}
 
-		request := make([]byte, size)
-		copy(request, buf[:size])
-		go s.HandleConn(request, clientAddr, conn)
-	}
+	errChan := make(chan error, 2)
+
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			size, clientAddr, err := udpConn.ReadFromUDP(buf)
+			if err != nil {
+				errChan <- err
+				return
+			}
+			request := make([]byte, size)
+			copy(request, buf[:size])
+			go s.HandleUDPConn(request, clientAddr, udpConn)
+		}
+	}()
+
+	go func() {
+		for {
+			conn, err := tcpListener.Accept()
+			if err != nil {
+				errChan <- err
+				return
+			}
+			go s.HandleTCPConn(conn)
+		}
+	}()
+
+	return <-errChan
 }
